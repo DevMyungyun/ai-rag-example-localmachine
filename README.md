@@ -78,29 +78,6 @@ Lines starting with `#` are treated as comments.
 
 ## Usage
 
-### Basic Usage
-
-```python
-from web_to_vector_db import WebToVectorPipeline
-
-# Initialize pipeline
-pipeline = WebToVectorPipeline(
-    chunk_size=1000,
-    chunk_overlap=200,
-    table_name="my_documents"
-)
-
-# Process web pages
-urls = [
-    "https://example.com/article1",
-    "https://example.com/article2",
-]
-pipeline.process_urls(urls)
-
-# Query the database
-results = pipeline.query("your question here", n_results=5)
-```
-
 ### Customization
 
 #### Adjust Chunking Parameters
@@ -144,6 +121,9 @@ POSTGRES_PORT=5432
 POSTGRES_DB=rag_database
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=gemma3:27b
+
 ```
 
 ### Vector Database
@@ -264,30 +244,6 @@ docker exec -it ollama-rag ollama pull phi
 ```
 
 ## Advanced Usage
-
-### Batch Processing
-
-```python
-# Process large number of URLs in batches
-all_urls = [...]  # Your list of URLs
-batch_size = 10
-
-for i in range(0, len(all_urls), batch_size):
-    batch = all_urls[i:i+batch_size]
-    pipeline.process_urls(batch)
-```
-
-### Custom Metadata
-
-Extend the pipeline to add custom metadata:
-
-```python
-def process_web_page_with_metadata(self, url: str, custom_meta: dict):
-    docs = self.process_web_page(url)
-    for doc in docs:
-        doc.metadata.update(custom_meta)
-    return docs
-```
 
 ## Tips for RAG Applications
 
