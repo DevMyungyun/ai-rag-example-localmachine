@@ -1,0 +1,10 @@
+docling
+requests
+beautifulsoup4
+langchain-text-splitters
+langchain-core
+psycopg2-binary
+pgvector
+sentence-transformers
+python-dotenv
+ollama
