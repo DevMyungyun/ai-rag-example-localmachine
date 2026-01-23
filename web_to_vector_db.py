@@ -9,13 +9,13 @@ from typing import List, Dict
 from pathlib import Path
 import requests
 from docling.document_converter import DocumentConverter
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import numpy as np
+from chonkie import SemanticChunker
+import re
 
 load_dotenv()
 
@@ -26,7 +26,7 @@ class WebToVectorPipeline:
     def __init__(
         self,
         chunk_size: int = 1000,
-        chunk_overlap: int = 200,
+        chunk_overlap: int = 100,
         table_name: str = "web_documents",
         db_host: str = None,
         db_port: int = None,
@@ -38,8 +38,8 @@ class WebToVectorPipeline:
         Initialize the pipeline.
         
         Args:
-            chunk_size: Size of text chunks
-            chunk_overlap: Overlap between chunks
+            chunk_size: Size of text chunks (500-1500 characters recommended)
+            chunk_overlap: Overlap between chunks (50-150 tokens recommended)
             table_name: Name of the database table
             db_host: PostgreSQL host (default: from env or localhost)
             db_port: PostgreSQL port (default: from env or 5432)
@@ -58,20 +58,23 @@ class WebToVectorPipeline:
         self.db_user = db_user or os.getenv("POSTGRES_USER", "postgres")
         self.db_password = db_password or os.getenv("POSTGRES_PASSWORD", "postgres")
         
-        # Initialize document converter (docling)
-        self.converter = DocumentConverter()
-        
-        # Initialize text splitter with improved separators
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
-        )
-        
-        # Initialize embedding model
+        # Initialize embedding model first (needed for semantic chunker)
+        print("Loading embedding model...")
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.embedding_dimension = 384  # all-MiniLM-L6-v2 produces 384-dimensional vectors
+        
+        # Initialize document converter with options to extract clean content
+        self.converter = DocumentConverter()
+        
+        # Initialize Chonkie semantic chunker for better chunking
+        print("Initializing semantic chunker...")
+        self.chunker = SemanticChunker(
+            embedding_model=self.embedding_model,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_sentences=1,
+            threshold=0.5  # Semantic similarity threshold
+        )
         
         # Initialize PostgreSQL connection
         print(f"Connecting to PostgreSQL at {self.db_host}:{self.db_port}")
@@ -107,6 +110,7 @@ class WebToVectorPipeline:
                     chunk_index INTEGER,
                     total_chunks INTEGER,
                     doc_type TEXT,
+                    section_header TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -308,16 +312,112 @@ class WebToVectorPipeline:
         
         return filepath
     
-    def process_web_page(self, url: str, update_if_exists: bool = True) -> List[Document]:
+    def clean_markdown_content(self, markdown_text: str) -> str:
         """
-        Process a single web page using docling.
+        Clean markdown content by removing navigation, ads, and other non-substantive text.
+        
+        Args:
+            markdown_text: Raw markdown from Docling
+            
+        Returns:
+            Cleaned markdown text
+        """
+        # Remove common navigation patterns
+        lines = markdown_text.split('\n')
+        cleaned_lines = []
+        
+        # Keywords that indicate non-substantive content
+        skip_patterns = [
+            r'\bnav\b', r'\bmenu\b', r'\bfooter\b', r'\bheader\b',
+            r'\bcookie\b', r'\badvertisement\b', r'\bsponsor\b',
+            r'\bshare this\b', r'\bfollow us\b', r'\bsocial media\b',
+            r'\bsign up\b', r'\bsubscribe\b', r'\bnewsletter\b'
+        ]
+        
+        for line in lines:
+            line_lower = line.lower()
+            
+            # Skip lines with navigation/footer patterns
+            if any(re.search(pattern, line_lower) for pattern in skip_patterns):
+                continue
+            
+            # Skip very short lines that are likely navigation
+            if len(line.strip()) > 0 and len(line.strip()) < 20 and line.strip().count(' ') < 2:
+                if not re.match(r'^#+\s', line):  # Keep markdown headers
+                    continue
+            
+            # Skip lines that are just links
+            if line.strip().startswith('[') and line.strip().endswith(')'):
+                continue
+            
+            cleaned_lines.append(line)
+        
+        cleaned_text = '\n'.join(cleaned_lines)
+        
+        # Remove excessive whitespace
+        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+        cleaned_text = re.sub(r' {2,}', ' ', cleaned_text)
+        
+        return cleaned_text.strip()
+    
+    def extract_section_headers(self, markdown_text: str) -> List[Dict[str, any]]:
+        """
+        Extract section headers and their positions from markdown.
+        
+        Args:
+            markdown_text: Markdown text
+            
+        Returns:
+            List of dicts with header info (text, level, position)
+        """
+        headers = []
+        lines = markdown_text.split('\n')
+        position = 0
+        
+        for line in lines:
+            # Match markdown headers (# Header)
+            match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if match:
+                level = len(match.group(1))
+                text = match.group(2).strip()
+                headers.append({
+                    'text': text,
+                    'level': level,
+                    'position': position
+                })
+            position += len(line) + 1  # +1 for newline
+        
+        return headers
+    
+    def get_section_for_position(self, headers: List[Dict], position: int) -> str:
+        """
+        Get the section header for a given text position.
+        
+        Args:
+            headers: List of headers from extract_section_headers
+            position: Character position in text
+            
+        Returns:
+            Section header text or empty string
+        """
+        current_header = ""
+        for header in headers:
+            if header['position'] <= position:
+                current_header = header['text']
+            else:
+                break
+        return current_header
+    
+    def process_web_page(self, url: str, update_if_exists: bool = True) -> Dict:
+        """
+        Process a single web page using docling with enhanced cleaning.
         
         Args:
             url: URL of the web page
             update_if_exists: If True, delete existing data before processing
             
         Returns:
-            List of Document objects with extracted content
+            Dict with markdown content, title, and metadata
         """
         print(f"Processing: {url}")
         
@@ -333,62 +433,87 @@ class WebToVectorPipeline:
         # Fetch the web page
         html_content = self.fetch_web_page(url)
         if not html_content:
-            return []
+            return {}
         
         # Save to temporary file
         temp_file = self.save_temp_html(html_content, url)
         
         try:
-            # Use docling to convert and extract content
+            # Use docling to convert HTML to markdown
             result = self.converter.convert(str(temp_file))
             
-            # Extract text content
-            text_content = result.document.export_to_markdown()
+            # Extract markdown content
+            raw_markdown = result.document.export_to_markdown()
             
-            # Create metadata
-            metadata = {
+            # Clean the markdown content (remove navigation, ads, etc.)
+            cleaned_markdown = self.clean_markdown_content(raw_markdown)
+            
+            if not cleaned_markdown or len(cleaned_markdown) < 100:
+                print(f"  ⚠️  Content too short after cleaning, skipping...")
+                return {}
+            
+            # Extract section headers for metadata
+            headers = self.extract_section_headers(cleaned_markdown)
+            
+            # Get title
+            title = getattr(result.document, "title", url)
+            if not title or title == url:
+                # Try to extract from first header
+                if headers:
+                    title = headers[0]['text']
+            
+            print(f"  ✓ Extracted {len(cleaned_markdown)} characters, {len(headers)} sections")
+            
+            return {
+                "content": cleaned_markdown,
+                "title": title,
                 "source": url,
-                "title": getattr(result.document, "title", url),
+                "headers": headers,
                 "type": "web_page"
             }
             
-            # Create document
-            doc = Document(
-                page_content=text_content,
-                metadata=metadata
-            )
-            
-            return [doc]
-            
         except Exception as e:
-            print(f"Error processing {url} with docling: {e}")
-            return []
+            print(f"  ❌ Error processing {url} with docling: {e}")
+            return {}
         finally:
             # Clean up temporary file
             if temp_file.exists():
                 temp_file.unlink()
     
-    def chunk_documents(self, documents: List[Document]) -> List[Document]:
+    def chunk_document(self, doc_data: Dict) -> List[Dict]:
         """
-        Split documents into smaller chunks.
+        Split document into semantic chunks using Chonkie.
         
         Args:
-            documents: List of documents to chunk
+            doc_data: Document data dict with content and metadata
             
         Returns:
-            List of chunked documents
+            List of chunk dicts with content and metadata
         """
-        chunked_docs = []
+        if not doc_data or 'content' not in doc_data:
+            return []
         
-        for doc in documents:
-            chunks = self.text_splitter.split_documents([doc])
+        content = doc_data['content']
+        headers = doc_data.get('headers', [])
+        
+        # Use Chonkie for semantic chunking
+        chunks = self.chunker.chunk(content)
+        
+        chunked_docs = []
+        for i, chunk in enumerate(chunks):
+            # Determine which section this chunk belongs to
+            chunk_start = content.find(chunk.text)
+            section_header = self.get_section_for_position(headers, chunk_start) if headers else ""
             
-            # Add chunk index to metadata
-            for i, chunk in enumerate(chunks):
-                chunk.metadata["chunk_index"] = i
-                chunk.metadata["total_chunks"] = len(chunks)
-            
-            chunked_docs.extend(chunks)
+            chunked_docs.append({
+                "content": chunk.text,
+                "source": doc_data.get('source', ''),
+                "title": doc_data.get('title', ''),
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                "type": doc_data.get('type', 'web_page'),
+                "section_header": section_header
+            })
         
         return chunked_docs
     
@@ -405,45 +530,45 @@ class WebToVectorPipeline:
         embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
         return embeddings.tolist()
     
-    def insert_to_vector_db(self, documents: List[Document]) -> None:
+    def insert_to_vector_db(self, chunks: List[Dict]) -> None:
         """
-        Insert documents into vector database.
+        Insert document chunks into vector database.
         
         Args:
-            documents: List of documents to insert
+            chunks: List of chunk dicts with content and metadata
         """
-        if not documents:
-            print("No documents to insert")
+        if not chunks:
+            print("No chunks to insert")
             return
         
-        print(f"Inserting {len(documents)} chunks into vector database...")
+        print(f"Inserting {len(chunks)} chunks into vector database...")
         
-        # Extract texts and metadata
-        texts = [doc.page_content for doc in documents]
+        # Extract texts
+        texts = [chunk['content'] for chunk in chunks]
         
         # Create embeddings
         embeddings = self.create_embeddings(texts)
         
         # Insert into PostgreSQL
         with self.conn.cursor() as cur:
-            for doc, embedding in zip(documents, embeddings):
-                metadata = doc.metadata
+            for chunk, embedding in zip(chunks, embeddings):
                 cur.execute(f"""
                     INSERT INTO {self.table_name} 
-                    (content, embedding, source, title, chunk_index, total_chunks, doc_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (content, embedding, source, title, chunk_index, total_chunks, doc_type, section_header)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
-                    doc.page_content,
+                    chunk['content'],
                     embedding,
-                    metadata.get('source'),
-                    metadata.get('title'),
-                    metadata.get('chunk_index'),
-                    metadata.get('total_chunks'),
-                    metadata.get('type')
+                    chunk.get('source'),
+                    chunk.get('title'),
+                    chunk.get('chunk_index'),
+                    chunk.get('total_chunks'),
+                    chunk.get('type'),
+                    chunk.get('section_header', '')
                 ))
         
         self.conn.commit()
-        print(f"Successfully inserted {len(documents)} chunks")
+        print(f"Successfully inserted {len(chunks)} chunks")
     
     def process_urls(self, urls: List[str], update_if_exists: bool = True) -> None:
         """
@@ -453,24 +578,31 @@ class WebToVectorPipeline:
             urls: List of URLs to process
             update_if_exists: If True, update existing URLs instead of creating duplicates
         """
-        all_documents = []
+        all_chunks = []
         
         # Process each URL
         for url in urls:
-            docs = self.process_web_page(url, update_if_exists=update_if_exists)
-            all_documents.extend(docs)
+            # Extract and clean document
+            doc_data = self.process_web_page(url, update_if_exists=update_if_exists)
+            
+            if not doc_data:
+                continue
+            
+            # Chunk document using semantic chunking
+            print(f"  Chunking with semantic analysis...")
+            chunks = self.chunk_document(doc_data)
+            print(f"  ✓ Created {len(chunks)} semantic chunks")
+            
+            all_chunks.extend(chunks)
         
-        if not all_documents:
+        if not all_chunks:
             print("No documents were successfully processed")
             return
         
-        # Chunk documents
-        print(f"\nChunking {len(all_documents)} documents...")
-        chunked_docs = self.chunk_documents(all_documents)
-        print(f"Created {len(chunked_docs)} chunks")
+        print(f"\nTotal: {len(all_chunks)} chunks from {len(urls)} URLs")
         
         # Insert into vector database
-        self.insert_to_vector_db(chunked_docs)
+        self.insert_to_vector_db(all_chunks)
     
     def query(self, query_text: str, n_results: int = 5) -> Dict:
         """
@@ -496,6 +628,7 @@ class WebToVectorPipeline:
                     chunk_index,
                     total_chunks,
                     doc_type,
+                    section_header,
                     1 - (embedding <=> %s::vector) as similarity
                 FROM {self.table_name}
                 ORDER BY embedding <=> %s::vector
@@ -516,9 +649,10 @@ class WebToVectorPipeline:
                 'title': row[2],
                 'chunk_index': row[3],
                 'total_chunks': row[4],
-                'type': row[5]
+                'type': row[5],
+                'section_header': row[6]
             })
-            distances.append(1 - row[6])  # Convert similarity to distance
+            distances.append(1 - row[7])  # Convert similarity to distance
         
         return {
             'documents': [documents],
@@ -547,13 +681,13 @@ def main():
         '--chunk-size', '-c',
         type=int,
         default=1000,
-        help='Chunk size for text splitting (default: 1000)'
+        help='Chunk size for text splitting (default: 1000, recommended: 500-1500)'
     )
     parser.add_argument(
         '--chunk-overlap', '-o',
         type=int,
-        default=200,
-        help='Chunk overlap (default: 200)'
+        default=100,
+        help='Chunk overlap (default: 100, recommended: 50-150 tokens)'
     )
     parser.add_argument(
         '--force', '-F',

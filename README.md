@@ -237,11 +237,55 @@ python rag_query.py -q "What are the rate limits?" -n 10
 docker exec -it ollama-rag ollama list
 
 # Pull other models
-docker exec -it ollama-rag ollama pull llama3.1
+docker exec -it ollama-rag ollama pull gemma3
 docker exec -it ollama-rag ollama pull mistral
 docker exec -it ollama-rag ollama pull codellama
-docker exec -it ollama-rag ollama pull phi
+docker exec -it ollama-rag ollama pull phi4
 ```
+
+### Memory Requirements for Large Models
+
+**Important**: Large language models require significant memory. If you encounter memory errors like:
+
+```
+Error: 500 Internal Server Error: model requires more system memory (18.4 GiB) than is available (6.6 GiB)
+```
+
+**Solutions:**
+
+1. **Increase Docker Memory Allocation** (Recommended for Mac/Windows):
+   - Open Docker Desktop
+   - Go to Settings → Resources
+   - Increase Memory to at least 20GB for large models
+   - Click "Apply & Restart"
+
+2. **Use Smaller Models**:
+   ```bash
+   # Instead of gemma3:27b (requires ~18GB), use:
+   python rag_query.py -m llama3.2        # ~4GB
+   python rag_query.py -m phi4            # ~3GB  
+   python rag_query.py -m mistral         # ~4GB
+   python rag_query.py -m gemma:7b        # ~5GB
+   ```
+
+3. **Check Available Models and Their Memory Requirements**:
+   ```bash
+   # List models with sizes
+   python rag_query.py --list-models
+   
+   # Test if a model can run
+   ollama run <model-name> "test"
+   ```
+
+**Memory Requirements by Model Size:**
+- 3B parameter models: ~4-6 GB RAM
+- 7B parameter models: ~8-12 GB RAM
+- 13B parameter models: ~16-20 GB RAM
+- 27B+ parameter models: ~20-32 GB RAM
+
+**Recommended for Development:**
+- Default Docker allocation: 8GB → Use models up to 7B parameters
+- Production/Large models: 20GB+ → Can use 13B-27B parameter models
 
 ## Advanced Usage
 

@@ -81,7 +81,7 @@ class RAGQuerySystem:
         print(f"Using Ollama model: {self.ollama_model} at {ollama_host}")
         
         # Check if model is available
-        self._check_ollama_model()
+        self.model_available = self._check_ollama_model()
     
     def expand_query(self, query: str) -> List[str]:
         """
@@ -106,21 +106,55 @@ class RAGQuerySystem:
         
         return expanded
     
-    def _check_ollama_model(self) -> None:
-        """Check if the Ollama model is available, if not provide instructions."""
+    def _check_ollama_model(self) -> bool:
+        """
+        Check if the Ollama model is available.
+        
+        Returns:
+            True if model is available, False otherwise
+        """
         try:
-            models = ollama.list()
-            model_names = [m['name'] for m in models.get('models', [])]
+            response = ollama.list()
             
-            if not any(self.ollama_model in name for name in model_names):
-                print(f"\n⚠️  Warning: Model '{self.ollama_model}' not found!")
-                print(f"Available models: {', '.join(model_names) if model_names else 'None'}")
-                print(f"\nTo pull the model, run:")
-                print(f"  docker exec -it ollama-rag ollama pull {self.ollama_model}")
-                print(f"  or: ollama pull {self.ollama_model}\n")
+            # Extract model names - handle different response formats
+            if isinstance(response, dict):
+                models_list = response.get('models', [])
+            else:
+                models_list = response
+            
+            # The correct key is 'model' not 'name'
+            model_names = []
+            for m in models_list:
+                if isinstance(m, dict):
+                    model_name = m.get('model', m.get('name', ''))
+                    model_names.append(model_name)
+                else:
+                    model_names.append(str(m))
+            
+            # Check if requested model is available
+            model_found = any(self.ollama_model in name for name in model_names if name)
+            
+            if not model_found:
+                print(f"\n❌ Error: Model '{self.ollama_model}' not found!")
+                print(f"\n📋 Available models:")
+                for name in model_names:
+                    if name:
+                        print(f"   - {name}")
+                print(f"\n💡 To pull the model, run:")
+                print(f"   ollama pull {self.ollama_model}")
+                print(f"   or: docker exec -it ollama-rag ollama pull {self.ollama_model}\n")
+                return False
+            else:
+                print(f"✓ Model '{self.ollama_model}' is available")
+                return True
+                
         except Exception as e:
-            print(f"⚠️  Warning: Could not connect to Ollama: {e}")
-            print("Make sure Ollama is running (docker-compose up -d)")
+            print(f"\n❌ Error: Could not connect to Ollama: {e}")
+            print("Make sure Ollama is running:")
+            print("  - Check: docker ps | grep ollama")
+            print("  - Start: docker-compose up -d")
+            print(f"  - Test: curl {os.getenv('OLLAMA_HOST', 'http://localhost:11434')}/api/tags\n")
+            return False
     
     def retrieve_context(
         self, 
@@ -321,28 +355,59 @@ Detailed Answer:"""
         Returns:
             Generated answer
         """
+        # Check if model is available before attempting to generate
+        if not self.model_available:
+            return f"\n❌ Cannot generate answer: Model '{self.ollama_model}' is not available.\nPlease pull the model first: ollama pull {self.ollama_model}"
+        
         try:
             if stream:
                 print("\nAnswer: ", end="", flush=True)
                 response_text = ""
+                chunk_count = 0
+                
                 for chunk in ollama.chat(
                     model=self.ollama_model,
                     messages=[{'role': 'user', 'content': prompt}],
                     stream=True
                 ):
-                    text = chunk['message']['content']
-                    print(text, end="", flush=True)
-                    response_text += text
+                    chunk_count += 1
+                    if 'message' in chunk and 'content' in chunk['message']:
+                        text = chunk['message']['content']
+                        print(text, end="", flush=True)
+                        response_text += text
+                    else:
+                        # Debug: unexpected chunk format
+                        print(f"\n[Debug: Unexpected chunk format: {chunk}]\n", flush=True)
+                
                 print()  # New line after streaming
+                
+                # Check if we got any response
+                if not response_text.strip():
+                    return f"\n⚠️  The model '{self.ollama_model}' returned an empty response.\nReceived {chunk_count} chunks but no text content.\nTry:\n  1. Using a different model: python rag_query.py --list-models\n  2. Reducing context with: -n 3\n  3. Checking model health: ollama run {self.ollama_model} 'test'"
+                
                 return response_text
             else:
                 response = ollama.chat(
                     model=self.ollama_model,
                     messages=[{'role': 'user', 'content': prompt}]
                 )
-                return response['message']['content']
+                
+                if 'message' not in response or 'content' not in response['message']:
+                    return f"\n⚠️  Unexpected response format from model '{self.ollama_model}': {response}"
+                
+                answer = response['message']['content']
+                
+                if not answer.strip():
+                    return f"\n⚠️  The model '{self.ollama_model}' returned an empty response.\nTry a different model or check if the model is working: ollama run {self.ollama_model} 'test'"
+                
+                return answer
+                
         except Exception as e:
-            return f"Error generating answer: {e}\nMake sure Ollama is running and the model is available."
+            error_msg = str(e)
+            if "model" in error_msg.lower() and "not found" in error_msg.lower():
+                return f"\n❌ Error: Model '{self.ollama_model}' not found.\nPull it with: ollama pull {self.ollama_model}"
+            else:
+                return f"\n❌ Error generating answer: {e}\n\nTroubleshooting:\n  1. Check Ollama is running: docker ps | grep ollama\n  2. Check model exists: ollama list\n  3. Pull model if needed: ollama pull {self.ollama_model}\n  4. Test model: ollama run {self.ollama_model} 'hello'"
     
     def query(
         self, 
@@ -493,8 +558,37 @@ def main():
         default=5,
         help='Number of documents to retrieve (default: 5)'
     )
+    parser.add_argument(
+        '--list-models',
+        action='store_true',
+        help='List all available Ollama models and exit'
+    )
     
     args = parser.parse_args()
+    
+    # List models if requested
+    if args.list_models:
+        try:
+            response = ollama.list()
+            models_list = response.get('models', []) if isinstance(response, dict) else response
+            
+            print("\n📋 Available Ollama Models:")
+            print("=" * 50)
+            for model in models_list:
+                if isinstance(model, dict):
+                    name = model.get('model', model.get('name', 'Unknown'))
+                    size = model.get('size', 0)
+                    size_gb = size / (1024**3) if size else 0
+                    print(f"  • {name} ({size_gb:.1f} GB)")
+                else:
+                    print(f"  • {model}")
+            print("=" * 50)
+            print(f"\nTo use a model: python rag_query.py -m <model-name> -q \"your question\"")
+            print(f"To pull a new model: ollama pull <model-name>\n")
+        except Exception as e:
+            print(f"\n❌ Error listing models: {e}")
+            print("Make sure Ollama is running.\n")
+        return
     
     # Initialize RAG system
     rag = RAGQuerySystem(ollama_model=args.model)

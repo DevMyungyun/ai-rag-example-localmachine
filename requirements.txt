@@ -1,10 +1,10 @@
 docling
 requests
 beautifulsoup4
-langchain-text-splitters
-langchain-core
+chonkie
 psycopg2-binary
 pgvector
 sentence-transformers
 python-dotenv
 ollama
+transformers
