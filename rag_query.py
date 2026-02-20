@@ -41,7 +41,7 @@ class RAGQuerySystem:
             db_name: Database name
             db_user: Database user
             db_password: Database password
-            ollama_model: Ollama model to use (default: llama3.2)
+            ollama_model: Ollama model to use (default: qwen2.5:7b)
             ollama_host: Ollama host URL
         """
         self.table_name = table_name
@@ -54,7 +54,7 @@ class RAGQuerySystem:
         self.db_password = db_password or os.getenv("POSTGRES_PASSWORD", "postgres")
         
         # Ollama settings
-        self.ollama_model = ollama_model or os.getenv("OLLAMA_MODEL", "llama3.2")
+        self.ollama_model = ollama_model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         ollama_host = ollama_host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
         
         # Initialize embedding model (same as used for document ingestion)
@@ -81,11 +81,14 @@ class RAGQuerySystem:
         print(f"Using Ollama model: {self.ollama_model} at {ollama_host}")
         
         # Check if model is available
-        self._check_ollama_model()
+        self.model_available = self._check_ollama_model()
+        
+        # Query embedding cache for optimization (LRU with max 100 entries)
+        self._embedding_cache = {}
+        self._cache_max_size = 100
     
     def expand_query(self, query: str) -> List[str]:
-        """
-        Expand the query with synonyms and related terms.
+        """        Expand the query with synonyms and related terms.
         
         Args:
             query: Original query
@@ -106,8 +109,53 @@ class RAGQuerySystem:
         
         return expanded
     
-    def _check_ollama_model(self) -> None:
-        """Check if the Ollama model is available, if not provide instructions."""
+    def _prepare_search_query(self, query: str) -> str:
+        """        Prepare query for full-text search by cleaning and normalizing.
+        
+        Args:
+            query: Raw query string
+            
+        Returns:
+            Cleaned query suitable for PostgreSQL FTS
+        """
+        # Remove special characters that interfere with tsquery
+        query = re.sub(r'[^\w\s-]', ' ', query)
+        
+        # Normalize whitespace
+        query = ' '.join(query.split())
+        
+        return query.strip()
+    
+    def _get_cached_embedding(self, query: str):
+        """        Get cached embedding or compute and cache it.
+        
+        Args:
+            query: Query string
+            
+        Returns:
+            Embedding vector as list
+        """
+        if query in self._embedding_cache:
+            return self._embedding_cache[query]
+        
+        # Compute embedding
+        embedding = self.embedding_model.encode([query])[0].tolist()
+        
+        # Cache with LRU logic
+        if len(self._embedding_cache) >= self._cache_max_size:
+            # Remove oldest entry (simple FIFO for now)
+            self._embedding_cache.pop(next(iter(self._embedding_cache)))
+        
+        self._embedding_cache[query] = embedding
+        return embedding
+    
+    def _check_ollama_model(self) -> bool:
+        """
+        Check if the Ollama model is available.
+        
+        Returns:
+            True if model is available, False otherwise
+        """
         try:
             models = ollama.list()
             model_names = [m['name'] for m in models.get('models', [])]
@@ -132,13 +180,14 @@ class RAGQuerySystem:
     ) -> List[Dict]:
         """
         Retrieve relevant documents from the vector database with enhanced accuracy.
+        Uses PostgreSQL full-text search combined with vector similarity.
         
         Args:
             query: User's question
             n_results: Number of documents to retrieve
             similarity_threshold: Minimum similarity score (0-1)
             use_reranking: Whether to use reranking for better results
-            use_hybrid: Whether to use hybrid search (vector + keyword)
+            use_hybrid: Whether to use hybrid search (vector + text)
             
         Returns:
             List of relevant documents with metadata
@@ -159,76 +208,115 @@ class RAGQuerySystem:
         expanded_queries = self.expand_query(query)
         print(f"   Searching with {len(expanded_queries)} query variations")
         
-        all_results = set()
+        # Retrieve more candidates for reranking
+        limit = n_results * 3 if use_reranking else n_results
         
-        # Vector search with expanded queries
-        for expanded_query in expanded_queries:
-            query_embedding = self.embedding_model.encode([expanded_query])[0].tolist()
-            
-            with self.conn.cursor() as cur:
-                # Retrieve more candidates for reranking
-                limit = n_results * 3 if use_reranking else n_results
+        # Prepare queries and get cached embeddings
+        prepared_queries = [self._prepare_search_query(q) for q in expanded_queries]
+        query_embeddings = [self._get_cached_embedding(q) for q in expanded_queries]
+        
+        # Unified hybrid search query with full-text search
+        with self.conn.cursor() as cur:
+            if use_hybrid:
+                # Hybrid search: vector similarity (0.7) + text rank (0.3)
+                # Build OR conditions for all query variations
+                or_conditions = []
+                params = []
                 
-                if use_hybrid:
-                    # Hybrid search: combine vector similarity with keyword matching
-                    cur.execute(f"""
-                        SELECT DISTINCT
+                for i, (q, qemb) in enumerate(zip(prepared_queries, query_embeddings)):
+                    or_conditions.append(f"""
+                        (
+                            content_tsvector @@ plainto_tsquery('english', %s)
+                            OR (1 - (embedding <=> %s::vector)) > %s
+                        )
+                    """)
+                    params.extend([q, qemb, similarity_threshold])
+                
+                where_clause = " OR ".join(or_conditions)
+                
+                # Build final parameter list for query
+                # First two params are for scoring in SELECT
+                final_params = [query_embeddings[0], prepared_queries[0]]
+                # Then add all the OR condition params
+                final_params.extend(params)
+                # Then add filter and limit params
+                final_params.extend([similarity_threshold, limit])
+                
+                cur.execute(f"""
+                    WITH scored_docs AS (
+                        SELECT DISTINCT ON (id)
+                            id,
                             content,
                             source,
                             title,
                             chunk_index,
                             total_chunks,
-                            (1 - (embedding <=> %s::vector)) + 
-                            CASE 
-                                WHEN content ILIKE %s THEN 0.2
-                                ELSE 0.0
-                            END as similarity
+                            (1 - (embedding <=> %s::vector)) as vector_score,
+                            ts_rank_cd(content_tsvector, plainto_tsquery('english', %s)) as text_rank
                         FROM {self.table_name}
-                        WHERE (1 - (embedding <=> %s::vector)) > %s
-                           OR content ILIKE %s
-                        ORDER BY similarity DESC
-                        LIMIT %s
-                    """, (
-                        query_embedding, 
-                        f'%{query}%',
-                        query_embedding, 
-                        similarity_threshold,
-                        f'%{query}%',
-                        limit
-                    ))
-                else:
-                    # Pure vector search
-                    cur.execute(f"""
+                        WHERE {where_clause}
+                    ),
+                    normalized_scores AS (
                         SELECT 
-                            content,
-                            source,
-                            title,
-                            chunk_index,
-                            total_chunks,
-                            1 - (embedding <=> %s::vector) as similarity
-                        FROM {self.table_name}
-                        WHERE 1 - (embedding <=> %s::vector) > %s
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s
-                    """, (query_embedding, query_embedding, similarity_threshold, query_embedding, limit))
-                
-                results = cur.fetchall()
-                all_results.update(results)
-        
-        # Convert to list and deduplicate
-        unique_results = list(all_results)
+                            *,
+                            text_rank / NULLIF(MAX(text_rank) OVER (), 0) as normalized_text_score
+                        FROM scored_docs
+                    )
+                    SELECT 
+                        content,
+                        source,
+                        title,
+                        chunk_index,
+                        total_chunks,
+                        vector_score,
+                        text_rank,
+                        normalized_text_score,
+                        (0.7 * vector_score + 0.3 * COALESCE(normalized_text_score, 0)) as hybrid_score
+                    FROM normalized_scores
+                    WHERE vector_score > %s OR text_rank > 0
+                    ORDER BY hybrid_score DESC
+                    LIMIT %s
+                """, final_params)
+            else:
+                # Pure vector search (fallback)
+                cur.execute(f"""
+                    SELECT 
+                        content,
+                        source,
+                        title,
+                        chunk_index,
+                        total_chunks,
+                        1 - (embedding <=> %s::vector) as vector_score,
+                        0 as text_rank,
+                        0 as normalized_text_score,
+                        1 - (embedding <=> %s::vector) as hybrid_score
+                    FROM {self.table_name}
+                    WHERE 1 - (embedding <=> %s::vector) > %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_embeddings[0], query_embeddings[0], query_embeddings[0], 
+                          similarity_threshold, query_embeddings[0], limit))
+            
+            results = cur.fetchall()
         
         # Format documents
         documents = []
-        for row in unique_results:
+        for row in results:
             documents.append({
                 'content': row[0],
                 'source': row[1],
                 'title': row[2],
                 'chunk_index': row[3],
                 'total_chunks': row[4],
-                'similarity': round(row[5], 3)
+                'vector_score': round(row[5], 3) if row[5] is not None else 0.0,
+                'text_rank': round(row[6], 4) if row[6] is not None else 0.0,
+                'normalized_text_score': round(row[7], 3) if row[7] is not None else 0.0,
+                'hybrid_score': round(row[8], 3) if row[8] is not None else 0.0,
+                'similarity': round(row[8], 3) if row[8] is not None else 0.0  # For backward compatibility
             })
+        
+        if not documents:
+            return []
         
         # Rerank results if enabled
         if use_reranking and documents:
@@ -240,14 +328,35 @@ class RAGQuerySystem:
             # Get reranking scores
             scores = self.reranker.predict(pairs)
             
-            # Add rerank scores and sort
-            for doc, score in zip(documents, scores):
-                doc['rerank_score'] = float(score)
+            # Normalize hybrid scores for RRF
+            max_hybrid = max(doc['hybrid_score'] for doc in documents)
             
-            documents.sort(key=lambda x: x['rerank_score'], reverse=True)
+            # Add rerank scores and calculate reciprocal rank fusion
+            for rank, (doc, score) in enumerate(zip(documents, scores)):
+                doc['rerank_score'] = float(score)
+                
+                # Reciprocal Rank Fusion (RRF) with k=60
+                hybrid_rank = rank + 1
+                rerank_list_rank = rank + 1  # Will be updated after sorting
+                
+                # Store initial rank for RRF calculation
+                doc['initial_rank'] = hybrid_rank
+            
+            # Sort by rerank score to get rerank positions
+            sorted_by_rerank = sorted(enumerate(documents), key=lambda x: x[1]['rerank_score'], reverse=True)
+            
+            # Calculate RRF scores combining hybrid and rerank positions
+            k = 60  # Standard RRF constant
+            for rerank_pos, (orig_idx, doc) in enumerate(sorted_by_rerank, 1):
+                hybrid_rrf = 1.0 / (k + doc['initial_rank'])
+                rerank_rrf = 1.0 / (k + rerank_pos)
+                doc['final_score'] = hybrid_rrf + rerank_rrf
+            
+            # Sort by final RRF score
+            documents.sort(key=lambda x: x['final_score'], reverse=True)
             documents = documents[:n_results]
             
-            print(f"   Selected top {len(documents)} after reranking")
+            print(f"   Selected top {len(documents)} after reranking with RRF")
         else:
             documents = documents[:n_results]
         
@@ -276,15 +385,23 @@ Answer:"""
         # Build context from documents
         context_parts = []
         for i, doc in enumerate(context_docs, 1):
-            # Include rerank score if available
-            score_info = f"similarity: {doc['similarity']}"
+            # Include all score types if available
+            score_info = f"similarity: {doc.get('similarity', 0):.3f}"
+            
+            # Add detailed scores if available (from new hybrid search)
+            if 'vector_score' in doc:
+                score_info = f"vector: {doc['vector_score']:.3f}, text: {doc['text_rank']:.4f}, hybrid: {doc['hybrid_score']:.3f}"
+            
             if 'rerank_score' in doc:
                 score_info += f", relevance: {doc['rerank_score']:.3f}"
+            
+            if 'final_score' in doc:
+                score_info += f", combined: {doc['final_score']:.3f}"
             
             context_parts.append(
                 f"[Document {i}]\n"
                 f"Source: {doc['source']}\n"
-                f"Score: {score_info}\n"
+                f"Scores: {score_info}\n"
                 f"Content: {doc['content']}\n"
             )
         
@@ -479,8 +596,8 @@ def main():
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='llama3.2',
-        help='Ollama model to use (default: llama3.2)'
+        default='qwen2.5:7b',
+        help='Ollama model to use (default: qwen2.5:7b)'
     )
     parser.add_argument(
         '--context', '-c',
