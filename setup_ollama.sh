@@ -14,7 +14,7 @@ elif [ -f .env.example ]; then
 fi
 
 # Default model if not set in env
-OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2}
+OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b}
 
 # Check if Ollama container is running
 if ! docker ps | grep -q ollama-rag; then
@@ -38,6 +38,6 @@ echo "  python rag_query.py                    # Interactive mode"
 echo "  python rag_query.py -q 'your question' # Single question"
 echo ""
 echo "To pull other models:"
-echo "  docker exec -it ollama-rag ollama pull llama3.1"
+echo "  docker exec -it ollama-rag ollama pull llama3.2:3b"
+echo "  docker exec -it ollama-rag ollama pull gemma2:9b"
 echo "  docker exec -it ollama-rag ollama pull mistral"
-echo "  docker exec -it ollama-rag ollama pull codellama"

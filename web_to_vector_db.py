@@ -92,11 +92,12 @@ class WebToVectorPipeline:
     def _create_table(self) -> None:
         """Create the vector database table if it doesn't exist."""
         with self.conn.cursor() as cur:
-            # Enable pgvector extension
+            # Enable required extensions
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
             self.conn.commit()
             
-            # Create table with vector column
+            # Create table with vector column and tsvector for full-text search
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
                     id SERIAL PRIMARY KEY,
@@ -107,20 +108,47 @@ class WebToVectorPipeline:
                     chunk_index INTEGER,
                     total_chunks INTEGER,
                     doc_type TEXT,
+                    section_header TEXT,
+                    content_tsvector tsvector,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             
-            # Create index for vector similarity search
+            # Get row count for optimal IVFFlat lists calculation
+            cur.execute(f"SELECT COUNT(*) FROM {self.table_name};")
+            row_count = cur.fetchone()[0]
+            lists = max(100, row_count // 1000) if row_count > 0 else 100
+            
+            # Create index for vector similarity search with dynamic lists
             cur.execute(f"""
                 CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx 
                 ON {self.table_name} 
                 USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
+                WITH (lists = {lists});
+            """)
+            
+            # Create GIN index for full-text search on tsvector
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_content_tsvector_idx
+                ON {self.table_name}
+                USING GIN (content_tsvector);
+            """)
+            
+            # Create GIN trigram index for fuzzy text matching
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_content_trgm_idx
+                ON {self.table_name}
+                USING GIN (content gin_trgm_ops);
+            """)
+            
+            # Create B-tree index on source for faster URL lookups
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_source_idx
+                ON {self.table_name} (source);
             """)
             
             self.conn.commit()
-            print(f"Table '{self.table_name}' is ready")
+            print(f"Table '{self.table_name}' is ready with optimized indexes")
     
     def check_url_exists(self, url: str) -> int:
         """
@@ -424,22 +452,24 @@ class WebToVectorPipeline:
         # Create embeddings
         embeddings = self.create_embeddings(texts)
         
-        # Insert into PostgreSQL
+        # Insert into PostgreSQL with tsvector population
         with self.conn.cursor() as cur:
             for doc, embedding in zip(documents, embeddings):
                 metadata = doc.metadata
                 cur.execute(f"""
                     INSERT INTO {self.table_name} 
-                    (content, embedding, source, title, chunk_index, total_chunks, doc_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (content, embedding, source, title, chunk_index, total_chunks, doc_type, section_header, content_tsvector)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_tsvector('english', %s))
                 """, (
                     doc.page_content,
                     embedding,
-                    metadata.get('source'),
-                    metadata.get('title'),
-                    metadata.get('chunk_index'),
-                    metadata.get('total_chunks'),
-                    metadata.get('type')
+                    chunk.get('source'),
+                    chunk.get('title'),
+                    chunk.get('chunk_index'),
+                    chunk.get('total_chunks'),
+                    chunk.get('type'),
+                    chunk.get('section_header', ''),
+                    chunk['content']
                 ))
         
         self.conn.commit()
